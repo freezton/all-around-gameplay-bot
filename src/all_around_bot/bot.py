@@ -158,5 +158,9 @@ class AllAroundBot(commands.Bot):
 
     async def close(self) -> None:
         log.info("Shutting down")
+        for cog in self.cogs.values():
+            flush = getattr(cog, "flush", None)
+            if flush is not None:
+                flush()
         await self.store.close()
         await super().close()

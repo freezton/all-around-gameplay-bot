@@ -5,14 +5,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import logging
 import math
+import os
 import struct
 import tempfile
+import threading
 import time
 from collections import deque
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
@@ -48,6 +53,16 @@ MAX_HISTORY = 50
 
 # One /play should not be able to enqueue an endless playlist.
 MAX_PLAYLIST_TRACKS = 100
+
+# Queue/timing snapshot persisted next to bot.db. The checkpoint interval bounds
+# how much playback position is lost if the host process is killed abruptly.
+STATE_VERSION = 1
+STATE_FILE = "voice_sessions.json"
+CHECKPOINT_INTERVAL = 30.0
+
+# A dropped voice connection is usually transient (network handover, voice server
+# migration). Retry before giving up and leaving the session parked.
+RECONNECT_DELAYS = (2.0, 5.0, 10.0, 20.0)
 
 PLAYLIST_OPTIONS = {
     **YTDLP_OPTIONS,
@@ -211,6 +226,79 @@ class Track:
     requester_name: str
 
 
+def _track_payload(track: Track) -> dict[str, Any]:
+    """Serialize a track without the direct stream URL (it expires)."""
+    return {
+        "title": track.title,
+        "page_url": track.page_url,
+        "duration": track.duration,
+        "requester_id": track.requester_id,
+        "requester_name": track.requester_name,
+    }
+
+
+def _track_from_payload(data: Any) -> Track | None:
+    if not isinstance(data, dict):
+        return None
+    page_url = data.get("page_url")
+    if not isinstance(page_url, str) or not page_url:
+        return None
+
+    duration = data.get("duration")
+    requester_id = data.get("requester_id")
+    return Track(
+        title=str(data.get("title") or "Unknown title"),
+        page_url=page_url,
+        stream_url=None,
+        duration=float(duration) if isinstance(duration, int | float) else None,
+        requester_id=int(requester_id) if isinstance(requester_id, int) else 0,
+        requester_name=str(data.get("requester_name") or "unknown"),
+    )
+
+
+class VoiceStateStore:
+    """Crash-safe JSON snapshot of the per-guild voice sessions.
+
+    Only one writer exists (the cog's save lock), so a fixed temporary file plus
+    ``os.replace`` is enough to make the file swap atomic.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        # _save_state() writes from a worker thread, while _save_now() can be
+        # called synchronously during shutdown. Serialize both writers.
+        self._write_lock = threading.Lock()
+
+    def load(self) -> dict[str, Any] | None:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            log.warning("Could not read voice state %s: %s", self.path, exc)
+            return None
+
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            log.warning("Ignoring corrupt voice state %s: %s", self.path, exc)
+            return None
+        if not isinstance(data, dict):
+            log.warning("Ignoring voice state %s: expected a JSON object", self.path)
+            return None
+        return data
+
+    def save(self, payload: dict[str, Any]) -> None:
+        with self._write_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f"{self.path.name}.tmp")
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+
+
 class QueueState:
     """Per-guild playback order. Pure state so it can be tested without Discord."""
 
@@ -308,6 +396,12 @@ class Session:
     stopped: bool = False
     offset: float = 0.0
     started_at: float | None = None
+    # Persisted across restarts. `resume_on_start` means this session was actively
+    # playing when it was saved; `restore_paused` remembers a paused player when
+    # the voice client is gone (disconnect/restart).
+    resume_on_start: bool = False
+    restore_paused: bool = False
+    message_id: int | None = None
 
 
 def _voice_diagnostics(voice_client: discord.VoiceClient) -> list[str]:
@@ -382,6 +476,11 @@ class Voice(commands.Cog):
         self._locks: dict[int, asyncio.Lock] = {}
         self._last_error: dict[int, str] = {}
         self._expected_leave: set[int] = set()
+        self._store: VoiceStateStore | None = None
+        self._save_lock = asyncio.Lock()
+        self._checkpoint_task: asyncio.Task[None] | None = None
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._resumed = False
 
         if not ensure_opus():
             log.warning("libopus not found - /play will fail until it is installed")
@@ -396,6 +495,406 @@ class Voice(commands.Cog):
                 "never become ready and voice audio is silently dropped. Pin davey<0.2.0."
             )
 
+    # --- persistence -----------------------------------------------------
+
+    async def cog_load(self) -> None:
+        path = self.bot.settings.database_path.parent / STATE_FILE
+        self._store = VoiceStateStore(path)
+        self._load_sessions()
+        self._checkpoint_task = asyncio.create_task(self._checkpoint_loop())
+
+    def cog_unload(self) -> None:
+        task = getattr(self, "_checkpoint_task", None)
+        if task is not None:
+            task.cancel()
+        for pending in list(getattr(self, "_tasks", ())):
+            pending.cancel()
+        self._save_now()
+
+    def flush(self) -> None:
+        """Synchronous final save, called by the bot before shutdown."""
+        self._save_now()
+
+    def _load_sessions(self) -> None:
+        store = getattr(self, "_store", None)
+        if store is None:
+            return
+
+        data = store.load()
+        if data is None:
+            return
+        if data.get("version") != STATE_VERSION:
+            log.warning(
+                "Ignoring voice state version %r (expected %s)",
+                data.get("version"),
+                STATE_VERSION,
+            )
+            return
+
+        raw_sessions = data.get("sessions")
+        if not isinstance(raw_sessions, list):
+            log.warning("Ignoring voice state: 'sessions' is not a list")
+            return
+
+        loaded = 0
+        resumable = 0
+        for raw in raw_sessions:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                guild_id = int(raw["guild_id"])
+                channel_id = int(raw["channel_id"])
+                text_channel_id = int(raw["text_channel_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            current = _track_from_payload(raw.get("current"))
+            raw_queue = raw.get("queue")
+            raw_history = raw.get("history")
+            queue = [
+                track
+                for item in (raw_queue if isinstance(raw_queue, list) else [])
+                if (track := _track_from_payload(item)) is not None
+            ]
+            history = [
+                track
+                for item in (raw_history if isinstance(raw_history, list) else [])
+                if (track := _track_from_payload(item)) is not None
+            ]
+            if current is None and not queue:
+                continue
+
+            session = Session(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                text_channel_id=text_channel_id,
+                view=PlayerView(self, guild_id),
+            )
+            session.state.current = current
+            session.state.queue = deque(queue)
+            session.state.history = history[-MAX_HISTORY:]
+            session.state.stay_after_end = raw.get("stay_after_end") is True
+            try:
+                session.offset = max(0.0, float(raw.get("offset") or 0.0))
+            except (TypeError, ValueError):
+                session.offset = 0.0
+            session.started_at = None
+            # The process just started, so there is no voice connection yet.
+            session.stopped = True
+            session.resume_on_start = raw.get("resume_on_start") is True
+            session.restore_paused = raw.get("paused") is True
+            message_id = raw.get("message_id")
+            if isinstance(message_id, int):
+                session.message_id = message_id
+
+            self._sessions[guild_id] = session
+            loaded += 1
+            if session.resume_on_start:
+                resumable += 1
+
+        log.info(
+            "Loaded %d persisted voice session(s); %d will resume",
+            loaded,
+            resumable,
+        )
+
+    def _session_payload(self, session: Session) -> dict[str, Any] | None:
+        if session.state.current is None and not session.state.queue:
+            return None
+
+        voice_client = self._voice_client(session.guild_id)
+        paused = (
+            bool(
+                voice_client is not None
+                and voice_client.is_connected()
+                and voice_client.is_paused()
+            )
+            or session.restore_paused
+        )
+        message_id = getattr(session.message, "id", None) or session.message_id
+
+        return {
+            "guild_id": session.guild_id,
+            "channel_id": session.channel_id,
+            "text_channel_id": session.text_channel_id,
+            "message_id": message_id,
+            "stopped": session.stopped,
+            "offset": round(max(0.0, self._position(session)), 3),
+            "paused": paused,
+            "resume_on_start": session.resume_on_start,
+            "stay_after_end": session.state.stay_after_end,
+            "current": (
+                _track_payload(session.state.current) if session.state.current is not None else None
+            ),
+            "queue": [_track_payload(track) for track in session.state.queue],
+            "history": [_track_payload(track) for track in session.state.history],
+        }
+
+    def _snapshot(self) -> dict[str, Any]:
+        sessions = [
+            payload
+            for session in self._sessions.values()
+            if (payload := self._session_payload(session)) is not None
+        ]
+        return {"version": STATE_VERSION, "sessions": sessions}
+
+    async def _save_state(self) -> None:
+        store = getattr(self, "_store", None)
+        if store is None:
+            return
+
+        lock = getattr(self, "_save_lock", None)
+        if lock is None:
+            lock = self._save_lock = asyncio.Lock()
+        try:
+            async with lock:
+                payload = self._snapshot()
+                await asyncio.to_thread(store.save, payload)
+        except Exception:
+            log.warning("Could not save voice state", exc_info=True)
+
+    def _save_now(self) -> None:
+        store = getattr(self, "_store", None)
+        if store is None:
+            return
+        try:
+            store.save(self._snapshot())
+        except Exception:
+            log.warning("Could not save voice state", exc_info=True)
+
+    async def _checkpoint_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(CHECKPOINT_INTERVAL)
+                if any(session.started_at is not None for session in self._sessions.values()):
+                    await self._save_state()
+        except asyncio.CancelledError:
+            raise
+
+    async def _attach_player_message(self, session: Session) -> None:
+        """Reconnect a loaded session to the player message it used before restart."""
+        if session.message is not None or session.message_id is None:
+            return
+        channel = self.bot.get_channel(session.text_channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        try:
+            session.message = await channel.fetch_message(session.message_id)
+        except discord.HTTPException:
+            session.message = None
+
+    async def _restore_player_message(self, session: Session, *, note: str | None = None) -> None:
+        await self._attach_player_message(session)
+        channel = self.bot.get_channel(session.text_channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            return
+
+        session.view = PlayerView(self, session.guild_id)
+        if session.message is not None:
+            if note is None:
+                await self._update_player_message(session)
+            else:
+                with contextlib.suppress(discord.HTTPException):
+                    await session.message.edit(content=note, view=None)
+            return
+
+        try:
+            session.message = await channel.send(
+                note or self._player_text(session),
+                view=None if note is not None else session.view,
+            )
+        except discord.HTTPException as exc:
+            log.warning("Could not restore player message in guild %s: %s", session.guild_id, exc)
+            return
+
+        if note is None:
+            await self._update_player_message(session)
+
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coro)
+        tasks = getattr(self, "_tasks", None)
+        if tasks is None:
+            tasks = self._tasks = set()
+        tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        tasks = getattr(self, "_tasks", None)
+        if tasks is not None:
+            tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("Background voice task failed", exc_info=error)
+
+    @commands.Cog.listener()
+    async def on_disconnect(self) -> None:
+        # Gateway shutdowns do not always unload cogs, so flush here as well.
+        self._save_now()
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if getattr(self, "_resumed", False):
+            return
+        self._resumed = True
+        for session in list(self._sessions.values()):
+            if session.resume_on_start and session.stopped:
+                try:
+                    await self._resume_session(session)
+                except Exception:
+                    log.exception("Could not resume voice in guild %s", session.guild_id)
+
+    async def _resume_session(self, session: Session) -> None:
+        """Rejoin the saved channel and continue from the last checkpoint."""
+        if not session.resume_on_start:
+            return
+
+        guild = self.bot.get_guild(session.guild_id)
+        if guild is None:
+            log.warning("Cannot resume voice in unknown guild %s", session.guild_id)
+            await self._save_state()
+            return
+
+        channel = guild.get_channel(session.channel_id)
+        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            log.warning(
+                "Voice channel %s in guild %s is gone; keeping the queue parked",
+                session.channel_id,
+                session.guild_id,
+            )
+            await self._restore_player_message(
+                session,
+                note="⏹️ The saved voice channel is gone. Run `/play` to resume.",
+            )
+            await self._save_state()
+            return
+
+        paused = session.restore_paused
+        async with self._lock(session.guild_id):
+            if self._sessions.get(session.guild_id) is not session or not session.resume_on_start:
+                return
+            try:
+                await self._connect(guild, channel)
+            except (TimeoutError, discord.ClientException, discord.Forbidden) as exc:
+                log.warning("Could not resume voice in guild %s: %s", session.guild_id, exc)
+                session.stopped = True
+                session.started_at = None
+                await self._restore_player_message(
+                    session,
+                    note=f"⏹️ Could not rejoin <#{session.channel_id}>: {exc}",
+                )
+                await self._save_state()
+                return
+
+            session.channel_id = channel.id
+            session.stopped = False
+            current = session.state.current
+            if current is not None:
+                current.stream_url = None
+                if not await self._play_track(session, current, offset=session.offset):
+                    await self._skip_locked(session)
+            elif session.state.queue:
+                await self._skip_locked(session)
+            else:
+                session.stopped = True
+                await self._save_state()
+                return
+
+            if self._sessions.get(session.guild_id) is not session:
+                return
+
+            if paused:
+                voice_client = self._voice_client(session.guild_id)
+                if voice_client is not None and voice_client.is_playing():
+                    session.offset = self._position(session)
+                    session.started_at = None
+                    session.restore_paused = True
+                    voice_client.pause()
+
+            await self._restore_player_message(session)
+            await self._save_state()
+
+    def _should_reconnect(self, session: Session) -> bool:
+        if self._sessions.get(session.guild_id) is not session or not session.stopped:
+            return False
+        # /stop clears resume_on_start; an idle stay-after-end waiter has no
+        # tracks to save and may still rejoin.
+        return session.resume_on_start or (
+            session.state.current is None and not session.state.queue
+        )
+
+    async def _reconnect(self, session: Session, *, paused: bool = False) -> None:
+        """Retry after an unexpected voice drop, keeping the queue intact."""
+        guild_id = session.guild_id
+        for attempt, delay in enumerate(RECONNECT_DELAYS, start=1):
+            await asyncio.sleep(delay)
+            if not self._should_reconnect(session):
+                return
+
+            guild = self.bot.get_guild(guild_id)
+            channel = guild.get_channel(session.channel_id) if guild is not None else None
+            if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                log.warning("Cannot reconnect in guild %s: channel is gone", guild_id)
+                break
+
+            log.info("Reconnecting to voice in guild %s (attempt %d)", guild_id, attempt)
+            async with self._lock(guild_id):
+                if not self._should_reconnect(session):
+                    return
+                try:
+                    await self._connect(guild, channel)
+                except (TimeoutError, discord.ClientException, discord.Forbidden) as exc:
+                    log.warning(
+                        "Voice reconnect attempt %d in guild %s failed: %s",
+                        attempt,
+                        guild_id,
+                        exc,
+                    )
+                    continue
+
+                session.channel_id = channel.id
+                session.stopped = False
+                current = session.state.current
+                if current is not None:
+                    current.stream_url = None
+                    if not await self._play_track(session, current, offset=session.offset):
+                        await self._skip_locked(session)
+                elif session.state.queue:
+                    await self._skip_locked(session)
+                else:
+                    # Reconnected while idle (e.g. a stay-after-end waiter).
+                    await self._restore_player_message(session)
+                    await self._save_state()
+                    return
+
+                if self._sessions.get(guild_id) is not session:
+                    return
+
+                if paused:
+                    voice_client = self._voice_client(guild_id)
+                    if voice_client is not None and voice_client.is_playing():
+                        session.offset = self._position(session)
+                        session.started_at = None
+                        session.restore_paused = True
+                        voice_client.pause()
+
+                await self._restore_player_message(session)
+                await self._save_state()
+                return
+
+        if self._sessions.get(guild_id) is session:
+            session.stopped = True
+            session.started_at = None
+            log.warning("Voice reconnect in guild %s failed; queue is parked", guild_id)
+            if session.message is not None:
+                with contextlib.suppress(discord.HTTPException):
+                    await session.message.edit(
+                        content="⏹️ Disconnected. Run `/play` to resume.",
+                        view=None,
+                    )
+            await self._save_state()
+
     # --- helpers ---------------------------------------------------------
 
     def _lock(self, guild_id: int) -> asyncio.Lock:
@@ -405,7 +904,10 @@ class Voice(commands.Cog):
         return lock
 
     def _voice_client(self, guild_id: int) -> discord.VoiceClient | None:
-        guild = self.bot.get_guild(guild_id)
+        bot = getattr(self, "bot", None)
+        if bot is None:
+            return None
+        guild = bot.get_guild(guild_id)
         return guild.voice_client if guild is not None else None
 
     def _channel_rejection(
@@ -564,6 +1066,8 @@ class Voice(commands.Cog):
         session.offset = self._position(session)
         session.started_at = None
         session.stopped = True
+        session.resume_on_start = False
+        session.restore_paused = False
         session.generation += 1
 
         voice_client = self._voice_client(session.guild_id)
@@ -582,8 +1086,11 @@ class Voice(commands.Cog):
             finally:
                 self._expected_leave.discard(session.guild_id)
 
+        await self._save_state()
+
     async def _teardown(self, session: Session, note: str) -> None:
         session.generation += 1
+        session.resume_on_start = False
         if self._sessions.get(session.guild_id) is session:
             self._sessions.pop(session.guild_id, None)
 
@@ -599,6 +1106,8 @@ class Voice(commands.Cog):
                     await voice_client.disconnect(force=False)
             finally:
                 self._expected_leave.discard(session.guild_id)
+
+        await self._save_state()
 
     # --- playback --------------------------------------------------------
 
@@ -629,6 +1138,8 @@ class Voice(commands.Cog):
 
         session.state.current = track
         session.offset = max(0.0, offset)
+        session.resume_on_start = True
+        session.restore_paused = False
         session.generation += 1
         generation = session.generation
         self._last_error.pop(session.guild_id, None)
@@ -676,6 +1187,12 @@ class Voice(commands.Cog):
             track.title,
         )
 
+        # Auto-resume can run against a voice client that is already playing
+        # (e.g. after an extension reload); replace that source instead of
+        # hitting "Already playing" and tearing down the queue.
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+
         try:
             voice_client.play(source, after=after)
         except discord.ClientException as exc:
@@ -686,6 +1203,7 @@ class Voice(commands.Cog):
 
         session.started_at = time.monotonic()
         await self._update_player_message(session)
+        await self._save_state()
         return True
 
     async def _handle_track_end(self, guild_id: int, generation: int) -> None:
@@ -752,6 +1270,7 @@ class Voice(commands.Cog):
 
                 session.channel_id = channel.id
                 session.stopped = False
+                await self._attach_player_message(session)
 
                 current = session.state.current
                 if current is not None:
@@ -763,6 +1282,7 @@ class Voice(commands.Cog):
                             content=f"Resumed in <#{session.channel_id}>."
                         )
                         await self._publish_player_message(session, interaction)
+                        await self._save_state()
                     else:
                         await interaction.edit_original_response(
                             content="Couldn't resume that track. Check the logs for details."
@@ -774,6 +1294,7 @@ class Voice(commands.Cog):
                     content=f"Waiting for tracks in <#{channel.id}>."
                 )
                 await self._publish_player_message(session, interaction)
+                await self._save_state()
                 return
 
             if session is not None:
@@ -814,6 +1335,7 @@ class Voice(commands.Cog):
                     content=f"Waiting for tracks in <#{channel.id}>."
                 )
                 await self._publish_player_message(session, interaction)
+                await self._save_state()
                 return
 
             try:
@@ -837,6 +1359,7 @@ class Voice(commands.Cog):
                 content=f"Waiting for tracks in <#{channel.id}>."
             )
             await self._publish_player_message(session, interaction)
+            await self._save_state()
 
     async def _skip_locked(self, session: Session) -> None:
         """Advance to the next track. The caller holds the guild lock."""
@@ -855,8 +1378,10 @@ class Voice(commands.Cog):
 
         session.offset = 0.0
         session.started_at = None
+        session.resume_on_start = False
         if session.state.stay_after_end:
             await self._update_player_message(session)
+            await self._save_state()
         else:
             await self._teardown(session, "Queue finished.")
 
@@ -873,13 +1398,16 @@ class Voice(commands.Cog):
         if voice_client.is_playing():
             session.offset = self._position(session)
             session.started_at = None
+            session.restore_paused = True
             voice_client.pause()
         elif voice_client.is_paused():
             session.started_at = time.monotonic()
+            session.restore_paused = False
             voice_client.resume()
 
         await interaction.response.defer()
         await self._update_player_message(session)
+        await self._save_state()
 
     async def handle_skip(self, interaction: discord.Interaction, guild_id: int) -> None:
         session = await self._control_session(interaction, guild_id)
@@ -1015,6 +1543,7 @@ class Voice(commands.Cog):
 
                 session.channel_id = channel.id
                 session.stopped = False
+                await self._attach_player_message(session)
 
                 current = session.state.current
                 if current is not None:
@@ -1028,6 +1557,7 @@ class Voice(commands.Cog):
                             content=f"Resumed in <#{session.channel_id}>."
                         )
                         await self._publish_player_message(session, interaction)
+                        await self._save_state()
                     else:
                         await interaction.edit_original_response(
                             content="Couldn't resume that track. Check the logs for details."
@@ -1101,6 +1631,7 @@ class Voice(commands.Cog):
 
                 await interaction.edit_original_response(content=f"Playing in <#{channel.id}>.")
                 await self._publish_player_message(session, interaction)
+                await self._save_state()
                 return
 
             first_position = len(session.state.queue) + 1
@@ -1119,6 +1650,7 @@ class Voice(commands.Cog):
                 note += f"\nI'm playing in <#{session.channel_id}>; join it to hear the queue."
             await interaction.edit_original_response(content=note)
             await self._update_player_message(session)
+            await self._save_state()
 
     @app_commands.command(
         name="skip",
@@ -1193,6 +1725,7 @@ class Voice(commands.Cog):
                 if session.message is not None:
                     with contextlib.suppress(discord.HTTPException):
                         await session.message.edit(content="⏹️ Queue cleared.", view=None)
+                await self._save_state()
             await interaction.edit_original_response(content="Discarded the saved queue.")
             return
 
@@ -1209,6 +1742,7 @@ class Voice(commands.Cog):
             removed = len(session.state.queue)
             session.state.queue.clear()
             await self._update_player_message(session)
+            await self._save_state()
 
         if removed == 0:
             await interaction.edit_original_response(content="The queue is already empty.")
@@ -1278,6 +1812,17 @@ class Voice(commands.Cog):
         channel = state.channel if state else None
 
         if session is not None and session.stopped:
+            if session.resume_on_start:
+                # After a crash/voice drop the session is parked but still marked
+                # for auto-resume; /stop is the way to cancel that safely.
+                session.resume_on_start = False
+                await self._save_state()
+                await interaction.response.send_message(
+                    "Auto-resume cancelled. The queue and position are still saved; "
+                    "use `/play` to continue or `/clearqueue` to discard.",
+                    ephemeral=True,
+                )
+                return
             await interaction.response.send_message(
                 "Already stopped. Use `/play` to continue or `/clearqueue` to discard.",
                 ephemeral=True,
@@ -1409,27 +1954,49 @@ class Voice(commands.Cog):
 
         guild_id = member.guild.id
         if before.channel is not None and after.channel is None:
-            parked = self._sessions.get(guild_id)
-            if parked is not None and parked.stopped:
+            session = self._sessions.get(guild_id)
+            if session is not None and session.stopped:
                 # /stop disconnects on purpose; keep the saved queue alive.
                 log.info("Parked voice session in guild %s", guild_id)
                 return
 
-            session = self._sessions.pop(guild_id, None)
-            if session is not None:
-                session.generation += 1
-                if session.message is not None:
-                    with contextlib.suppress(discord.HTTPException):
-                        await session.message.edit(content="⏹️ Disconnected from voice.", view=None)
             if guild_id in self._expected_leave:
+                # _teardown/_stop already updated the session; never discard a
+                # queue here just because the leave was intentional.
                 log.info("Left voice in guild %s", guild_id)
-            else:
-                log.info("Voice connection lost in guild %s; playback stopped", guild_id)
+                return
+
+            if session is None:
+                log.info("Voice connection lost in guild %s (no session)", guild_id)
+                return
+
+            # An unexpected drop must not throw away the queue: park it, save the
+            # position, and try to rejoin before falling back to manual /play.
+            voice_client = self._voice_client(guild_id)
+            paused = session.restore_paused or bool(
+                voice_client is not None and voice_client.is_paused()
+            )
+            session.offset = self._position(session)
+            session.started_at = None
+            session.stopped = True
+            session.restore_paused = paused
+            session.generation += 1
+            log.warning(
+                "Voice connection lost in guild %s; keeping %d queued track(s)",
+                guild_id,
+                len(session.state.queue),
+            )
+            if session.message is not None:
+                with contextlib.suppress(discord.HTTPException):
+                    await session.message.edit(content="⏹️ Disconnected — reconnecting…", view=None)
+            await self._save_state()
+            self._spawn(self._reconnect(session, paused=paused))
         elif after.channel is not None and before.channel != after.channel:
             session = self._sessions.get(guild_id)
             if session is not None:
                 session.channel_id = after.channel.id
                 log.info("Moved to voice channel %s in guild %s", after.channel.id, guild_id)
+                await self._save_state()
 
 
 async def setup(bot: AllAroundBot) -> None:

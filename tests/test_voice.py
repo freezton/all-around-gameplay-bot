@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import types
 from collections import deque
 
@@ -12,6 +13,7 @@ from all_around_bot.cogs.voice import (
     Session,
     Track,
     Voice,
+    VoiceStateStore,
     describe_queue,
     format_duration,
     is_playlist_url,
@@ -645,3 +647,167 @@ async def test_join_or_resume_reports_already_playing(monkeypatch) -> None:
     assert "Already playing" in interaction.original_response
     assert interaction.response.ephemeral is True
     assert session.stopped is False
+
+
+def test_voice_state_store_round_trip(tmp_path) -> None:
+    store = VoiceStateStore(tmp_path / "voice_sessions.json")
+    payload = {"version": 1, "sessions": [{"guild_id": 1, "channel_id": 2}]}
+
+    store.save(payload)
+
+    assert store.load() == payload
+    assert not (tmp_path / "voice_sessions.json.tmp").exists()
+
+
+def test_voice_state_store_missing_and_corrupt_files(tmp_path) -> None:
+    path = tmp_path / "voice_sessions.json"
+    store = VoiceStateStore(path)
+
+    assert store.load() is None
+
+    path.write_text("not json")
+    assert store.load() is None
+
+
+def _bare_storage_cog(store: VoiceStateStore, monkeypatch) -> Voice:
+    cog = Voice.__new__(Voice)
+    cog._sessions = {}
+    cog._store = store
+    monkeypatch.setattr(
+        cog,
+        "_voice_client",
+        lambda _guild_id: types.SimpleNamespace(
+            is_connected=lambda: True,
+            is_paused=lambda: False,
+        ),
+    )
+    return cog
+
+
+def test_snapshot_omits_expiring_stream_url_and_restores_queue(tmp_path, monkeypatch) -> None:
+    store = VoiceStateStore(tmp_path / "voice_sessions.json")
+    cog = _bare_storage_cog(store, monkeypatch)
+
+    session = _session_with("now")
+    session.state.enqueue(_track("next"), stay_after_end=False)
+    session.offset = 42.5
+    session.started_at = None
+    session.resume_on_start = True
+    session.message_id = 777
+    cog._sessions[1] = session
+
+    cog._save_now()
+
+    raw = store.path.read_text()
+    assert "example.test" not in raw
+    assert "stream_url" not in raw
+
+    restored_cog = Voice.__new__(Voice)
+    restored_cog._sessions = {}
+    restored_cog._store = store
+    restored_cog._load_sessions()
+
+    restored = restored_cog._sessions[1]
+    assert restored.state.current is not None
+    assert restored.state.current.title == "now"
+    assert restored.state.current.stream_url is None
+    assert [track.title for track in restored.state.queue] == ["next"]
+    assert restored.offset == 42.5
+    assert restored.stopped is True
+    assert restored.resume_on_start is True
+    assert restored.message_id == 777
+
+
+def test_snapshot_saves_elapsed_position(monkeypatch) -> None:
+    cog = Voice.__new__(Voice)
+    cog._sessions = {}
+    monkeypatch.setattr(cog, "_voice_client", lambda _guild_id: None)
+
+    session = _session_with("a")
+    session.offset = 5.0
+    session.started_at = 90.0
+    monkeypatch.setattr("all_around_bot.cogs.voice.time.monotonic", lambda: 100.0)
+
+    payload = cog._session_payload(session)
+
+    assert payload is not None
+    assert payload["offset"] == 15.0
+
+
+def test_stopped_session_is_not_marked_for_resume(tmp_path, monkeypatch) -> None:
+    store = VoiceStateStore(tmp_path / "voice_sessions.json")
+    cog = _bare_storage_cog(store, monkeypatch)
+
+    session = _session_with("a")
+    session.stopped = True
+    session.resume_on_start = False
+    cog._sessions[1] = session
+
+    cog._save_now()
+    restored_cog = Voice.__new__(Voice)
+    restored_cog._sessions = {}
+    restored_cog._store = store
+    restored_cog._load_sessions()
+
+    assert restored_cog._sessions[1].resume_on_start is False
+
+
+def test_reconnect_is_cancelled_by_stop() -> None:
+    cog = Voice.__new__(Voice)
+    session = _session_with("a")
+    session.stopped = True
+    session.resume_on_start = True
+    cog._sessions = {1: session}
+
+    assert cog._should_reconnect(session) is True
+
+    session.resume_on_start = False
+    assert cog._should_reconnect(session) is False
+
+
+@pytest.mark.asyncio
+async def test_unexpected_disconnect_parks_and_keeps_queue(monkeypatch) -> None:
+    cog = Voice.__new__(Voice)
+    cog._sessions = {}
+    cog._locks = {}
+    cog._last_error = {}
+    cog._expected_leave = set()
+    cog._tasks = set()
+    cog.bot = types.SimpleNamespace(user=types.SimpleNamespace(id=99))
+
+    session = _session_with("a")
+    session.state.enqueue(_track("b"), stay_after_end=False)
+    session.offset = 5.0
+    session.started_at = time.monotonic() - 30
+    session.resume_on_start = True
+    cog._sessions[1] = session
+
+    spawned: list[object] = []
+    saved: list[bool] = []
+
+    async def fake_save() -> None:
+        saved.append(True)
+
+    def fake_spawn(coro) -> None:
+        spawned.append(coro)
+        coro.close()
+
+    monkeypatch.setattr(cog, "_voice_client", lambda _guild_id: None)
+    monkeypatch.setattr(cog, "_save_state", fake_save)
+    monkeypatch.setattr(cog, "_spawn", fake_spawn)
+
+    member = types.SimpleNamespace(id=99, guild=types.SimpleNamespace(id=1))
+    before = types.SimpleNamespace(channel=object())
+    after = types.SimpleNamespace(channel=None)
+
+    await cog.on_voice_state_update(member, before, after)
+
+    assert cog._sessions.get(1) is session
+    assert session.stopped is True
+    assert 34.0 <= session.offset <= 36.0
+    assert session.state.current is not None
+    assert session.state.current.title == "a"
+    assert [track.title for track in session.state.queue] == ["b"]
+    assert session.resume_on_start is True
+    assert len(spawned) == 1
+    assert saved == [True]

@@ -40,6 +40,11 @@ Discord-style "screenshot" images.
   queue and the current track's position** so `/play` can resume. While a
   session is playing it obeys the same voice-channel/text-channel rules as
   `/play`.
+- **Durable queue** — the queue, current track, history, and playback position
+  are saved to `data/voice_sessions.json` after every change and every 30
+  seconds while playing. After an unexpected voice drop the bot keeps the queue
+  and reconnects; after a bot restart it rejoins the saved channel and resumes
+  from the last checkpoint. `/stop` cancels auto-resume while keeping the queue.
 - **Now-playing message** — the bot keeps one player message per session with
   ⏮️ previous, ⏸️/▶️ pause/resume, and ⏭️ next buttons. Every control (buttons,
   `/skip`, `/jump`, `/clearqueue`, `/stop`) must come from the session's voice
@@ -139,10 +144,13 @@ uv run ruff format .
   `cdn.discordapp.com`) and cached in `data/emoji/`. If a download fails, that
   emoji falls back to its text form (`:name:`).
 - Animated custom emoji render as their first frame.
-- Voice is one queue per server (one voice connection). The queue, the saved
-  `/stop` position, and the playback buttons live in memory: restarting the bot
-  loses them, and the buttons on old player messages stop working. There is no
-  seek command; resuming after `/stop` is the only way to start mid-track.
+- Voice is one queue per server (one voice connection). The queue and saved
+  position are durable (`data/voice_sessions.json`), but resuming after a
+  restart requires the **process** to start again: use systemd/a process
+  supervisor on a VPS, or a wake lock plus Termux:Boot on Android. If the saved
+  voice channel was deleted, the bot keeps the queue parked and waits for
+  `/play`. There is no seek command; resuming after `/stop` or a restart is the
+  only way to start mid-track.
 - `davey` is pinned below 0.2.0 on purpose. discord.py 2.7.x calls the old DAVE
   API; with 0.2.0 the encryption session never becomes ready and Discord drops
   the bot's audio (it looks like it is speaking but nobody hears it).
