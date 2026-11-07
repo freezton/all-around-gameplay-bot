@@ -161,6 +161,8 @@ class AllAroundBot(commands.Bot):
         for cog in self.cogs.values():
             flush = getattr(cog, "flush", None)
             if flush is not None:
-                flush()
+                result = flush()
+                if asyncio.iscoroutine(result):
+                    await result
         await self.store.close()
         await super().close()
