@@ -1,0 +1,19 @@
+apt update
+apt install -y ca-certificates openssl
+update-ca-certificates
+
+apt install libopus0
+
+rm -f /root/.local/bin/uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+hash -r
+source $HOME/.local/bin/env
+uv --version
+
+uv python install 3.13
+
+git clone https://github.com/freezton/all-around-gameplay-bot.git
+cd all-around-gameplay-bot
+
+rm -rf .venv
+uv sync --python 3.13
