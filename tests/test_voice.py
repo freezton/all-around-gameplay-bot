@@ -752,6 +752,32 @@ def test_stopped_session_is_not_marked_for_resume(tmp_path, monkeypatch) -> None
     assert restored_cog._sessions[1].resume_on_start is False
 
 
+@pytest.mark.asyncio
+async def test_ready_resumes_only_flagged_sessions(monkeypatch) -> None:
+    cog = Voice.__new__(Voice)
+    active = _session_with("a")
+    active.stopped = True
+    active.resume_on_start = True
+    parked = _session_with("b")
+    parked.guild_id = 2
+    parked.stopped = True
+    parked.resume_on_start = False
+    cog._sessions = {1: active, 2: parked}
+    cog._resumed = False
+
+    resumed: list[int] = []
+
+    async def fake_resume(session: Session) -> None:
+        resumed.append(session.guild_id)
+
+    monkeypatch.setattr(cog, "_resume_session", fake_resume)
+
+    await cog.on_ready()
+    await cog.on_ready()
+
+    assert resumed == [1]
+
+
 def test_reconnect_is_cancelled_by_stop() -> None:
     cog = Voice.__new__(Voice)
     session = _session_with("a")
