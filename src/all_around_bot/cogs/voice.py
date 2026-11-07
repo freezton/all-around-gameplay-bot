@@ -785,6 +785,9 @@ class Voice(commands.Cog):
                     note=f"⏹️ Could not rejoin <#{session.channel_id}>: {exc}",
                 )
                 await self._save_state()
+                # Discord may still be clearing the old voice session after a
+                # process restart; retry before giving up.
+                self._spawn(self._reconnect(session, paused=session.restore_paused))
                 return
 
             session.channel_id = channel.id
